@@ -312,9 +312,9 @@ Java_com_llamatik_library_platform_LlamaBridge_embed(JNIEnv *env, jobject, jstri
     //    it is required that the sequence positions remain consecutive
     //
     // The effect is that embed() works exactly once per process: the first
-    // call succeeds and every later one returns null. Re-loading the model
-    // does not help, because callers reach the same state on their next
-    // embed.
+    // call succeeds and every later one returns null. Tearing down and
+    // re-initialising the model does reset the state, but that means a
+    // full model load per embedding.
     //
     // The generation entry points already do exactly this for the same
     // reason (see llama_memory_clear on gen_ctx below); the embedding path

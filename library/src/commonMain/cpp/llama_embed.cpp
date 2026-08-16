@@ -147,9 +147,8 @@ float *llama_embed(const char *input) {
     // for the same sequence collides with positions already in the cache
     // and fails. The effect is that llama_embed() works exactly once per
     // process: the first call succeeds, every later one returns nullptr.
-    // Reloading the model does not help either — llama_embed_free()
-    // tears down the context but callers reach the same state again on
-    // their next embed.
+    // Tearing down and re-initialising the model does reset the state,
+    // but that means a full model load per embedding.
     //
     // llama_generate() already does exactly this for the same reason
     // ("Cleared KV cache for new generation turn"); the embedding path
