@@ -140,6 +140,22 @@ float *llama_embed(const char *input) {
     }
     tokens.resize(n_tokens);
 
+    // Drop the previous call's cells before decoding this one.
+    //
+    // Every call re-uses sequence 0 and numbers positions from zero
+    // (batch.pos[i] = i below), so without this the second llama_decode()
+    // for the same sequence collides with positions already in the cache
+    // and fails. The effect is that llama_embed() works exactly once per
+    // process: the first call succeeds, every later one returns nullptr.
+    // Reloading the model does not help either — llama_embed_free()
+    // tears down the context but callers reach the same state again on
+    // their next embed.
+    //
+    // llama_generate() already does exactly this for the same reason
+    // ("Cleared KV cache for new generation turn"); the embedding path
+    // was simply missing it.
+    llama_memory_clear(llama_get_memory(ctx), false);
+
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     batch.n_tokens = n_tokens;
     for (int i = 0; i < n_tokens; i++) {

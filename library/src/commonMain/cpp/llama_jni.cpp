@@ -300,6 +300,27 @@ Java_com_llamatik_library_platform_LlamaBridge_embed(JNIEnv *env, jobject, jstri
     }
     tokens.resize(n_tokens);
 
+    // Drop the previous call's cells before decoding this one.
+    //
+    // Every call re-uses sequence 0 and numbers positions from zero
+    // (batch.pos[i] = i below), so without this the second llama_decode()
+    // for the same sequence is rejected:
+    //
+    //   init: the tokens of sequence 0 ... have inconsistent sequence positions
+    //    - the last position stored in the memory module ... is X = 9
+    //    - the tokens ... have a starting position of Y = 0
+    //    it is required that the sequence positions remain consecutive
+    //
+    // The effect is that embed() works exactly once per process: the first
+    // call succeeds and every later one returns null. Re-loading the model
+    // does not help, because callers reach the same state on their next
+    // embed.
+    //
+    // The generation entry points already do exactly this for the same
+    // reason (see llama_memory_clear on gen_ctx below); the embedding path
+    // was simply missing it.
+    llama_memory_clear(llama_get_memory(emb_ctx), false);
+
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     batch.n_tokens = n_tokens;
     for (int i = 0; i < n_tokens; ++i) {
