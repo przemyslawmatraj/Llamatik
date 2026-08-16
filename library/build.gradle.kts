@@ -309,12 +309,20 @@ publishing {
     }
 }
 
-signing {
-    useInMemoryPgpKeys(
-        (findProperty("signingInMemoryKey") as String?) ?: System.getenv("SIGNING_KEY"),
-        (findProperty("signingInMemoryKeyPassword") as String?) ?: System.getenv("SIGNING_PASSWORD")
-    )
-    sign(publishing.publications)
+// Signing is required for Maven Central, but not for a local build that
+// only ever lands in ~/.m2. Without a key the publication still declares
+// .asc artifacts and then fails because the files were never produced,
+// so skip the whole block rather than the signing task alone.
+val signingKey = (findProperty("signingInMemoryKey") as String?) ?: System.getenv("SIGNING_KEY")
+
+if (signingKey != null) {
+    signing {
+        useInMemoryPgpKeys(
+            signingKey,
+            (findProperty("signingInMemoryKeyPassword") as String?) ?: System.getenv("SIGNING_PASSWORD")
+        )
+        sign(publishing.publications)
+    }
 }
 
 afterEvaluate {
