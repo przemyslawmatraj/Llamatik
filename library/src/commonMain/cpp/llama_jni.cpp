@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>   // strlen, memcpy
 #include <cctype>    // tolower, isalpha, isdigit
+#include <cstdio>    // snprintf
 #include <cstdlib>   // malloc, free
 #include <string_view>
 #include <vector>
@@ -83,6 +84,58 @@ static void truncate_to_ctx(std::vector<llama_token> &tokens, int n_ctx, int res
     out.reserve(keep);
     out.insert(out.end(), tokens.end() - keep, tokens.end());
     tokens.swap(out);
+}
+
+// Output cap of the original entry points (generate, generateWithContext,
+// generateStream, generateStreamWithContext). The *WithLimit entry points
+// take theirs from the caller instead.
+static const int kLegacyMaxNewTokens = 640;
+
+// Decodes the whole prompt into `ctx` as sequence 0, positions 0..n-1, in
+// consecutive chunks of at most llama_n_batch(ctx) tokens. Only the very
+// last prompt token requests logits, so the first sample reads the same
+// row it did when the prompt went in as one batch.
+//
+// One llama_decode() per prompt is not an option: llama.cpp asserts
+// n_tokens <= n_batch (GGML_ASSERT, i.e. abort()), so any prompt longer
+// than n_batch (2048 by default) used to kill the whole app process with
+// SIGABRT instead of returning an error.
+//
+// Returns 0 on success, otherwise the non-zero llama_decode() result.
+static int decode_prompt_chunked(llama_context *ctx, const std::vector<llama_token> &tokens) {
+    const int n_tokens = (int) tokens.size();
+    if (n_tokens <= 0) return -1;
+    const int n_batch = std::max(1, (int) llama_n_batch(ctx));
+
+    llama_batch batch = llama_batch_init(std::min(n_tokens, n_batch), 0, 1);
+    int rc = 0;
+    for (int start = 0; start < n_tokens && rc == 0; start += n_batch) {
+        const int n = std::min(n_batch, n_tokens - start);
+        batch.n_tokens = n;
+        for (int i = 0; i < n; ++i) {
+            const int pos = start + i;
+            batch.token[i]     = tokens[pos];
+            batch.pos[i]       = pos;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]    = (pos == n_tokens - 1);
+        }
+        rc = llama_decode(ctx, batch);
+    }
+    llama_batch_free(batch);
+    return rc;
+}
+
+// Output limit requested by a *WithLimit caller, clamped to 1..n_ctx.
+static inline int clamp_max_new_tokens(int requested, int n_ctx) {
+    return std::max(1, std::min(requested, n_ctx));
+}
+
+// Error text for a prompt that cannot fit together with its output limit.
+static std::string prompt_too_long_message(int n_prompt, int max_new_tokens, int n_ctx) {
+    char msg[96];
+    std::snprintf(msg, sizeof(msg), "prompt_too_long: %d + %d > %d", n_prompt, max_new_tokens, n_ctx);
+    return std::string(msg);
 }
 
 // ---------- Sanitizer (strong, used by non-streaming only) ----------
@@ -394,9 +447,53 @@ LOGI("Gen context ready. n_ctx=%d", llama_n_ctx(gen_ctx));
 return JNI_TRUE;
 }
 
+// Same as initGenerateModel(), but with the context window chosen by the
+// caller: n_ctx = nCtx clamped to 512..32768, n_batch = min(2048, n_ctx).
+// n_ubatch and every other context parameter stay at llama.cpp defaults,
+// exactly as in initGenerateModel().
 extern "C"
-JNIEXPORT jstring JNICALL
-        Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, jstring input) {
+JNIEXPORT jboolean JNICALL
+Java_com_llamatik_library_platform_LlamaBridge_initGenerateModelWithContext(
+        JNIEnv *env, jobject, jstring modelPath, jint nCtx) {
+    const int n_ctx   = std::max(512, std::min((int) nCtx, 32768));
+    const int n_batch = std::min(2048, n_ctx);
+
+    const char *path = env->GetStringUTFChars(modelPath, nullptr);
+    LOGI("initGenerateModelWithContext: %s (n_ctx=%d)", path ? path : "(null)", n_ctx);
+
+    if (!g_backend_inited) {
+        llama_backend_init();
+        g_backend_inited = true;
+    }
+
+    llama_model_params mparams = llama_model_default_params();
+    gen_model = llama_model_load_from_file(path, mparams);
+    env->ReleaseStringUTFChars(modelPath, path);
+    if (!gen_model) { LOGE("gen model load failed"); return JNI_FALSE; }
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.embeddings = false;
+    cparams.n_ctx      = (uint32_t) n_ctx;
+    cparams.n_batch    = (uint32_t) n_batch;
+    gen_ctx = llama_init_from_model(gen_model, cparams);
+    if (!gen_ctx) { llama_model_free(gen_model); gen_model = nullptr; return JNI_FALSE; }
+
+    LOGI("Gen context ready. n_ctx=%d n_batch=%d",
+         (int) llama_n_ctx(gen_ctx), (int) llama_n_batch(gen_ctx));
+    return JNI_TRUE;
+}
+
+// One-shot generation shared by generate() and generateWithLimit().
+//
+// explicit_limit == false is the original generate() contract: at most
+// kLegacyMaxNewTokens new tokens, and a prompt longer than n_ctx - 8
+// tokens is cut from the front.
+//
+// explicit_limit == true is generateWithLimit(): max_new_tokens_req is
+// clamped to 1..n_ctx and the prompt is never cut. When prompt tokens +
+// limit exceed n_ctx nothing is decoded; the call logs
+// "prompt_too_long: <prompt> + <max> > <n_ctx>" and returns null.
+static jstring generate_impl(JNIEnv *env, jstring input, bool explicit_limit, int max_new_tokens_req) {
 if (!gen_ctx || !gen_model) { LOGE("generate: ctx/model null"); return nullptr; }
 
 const char *prompt = env->GetStringUTFChars(input, nullptr);
@@ -413,19 +510,16 @@ if (n_tokens <= 0) { LOGE("tokenize failed"); return nullptr; }
 tokens.resize(n_tokens);
 
 const int n_ctx = llama_n_ctx(gen_ctx);
-if ((int)tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
+int max_new_tokens = kLegacyMaxNewTokens;
+if (explicit_limit) {
+    max_new_tokens = clamp_max_new_tokens(max_new_tokens_req, n_ctx);
+    if (n_tokens + max_new_tokens > n_ctx) {
+        LOGE("%s", prompt_too_long_message(n_tokens, max_new_tokens, n_ctx).c_str());
+        return nullptr;
+    }
+} else if ((int)tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
 
-llama_batch batch = llama_batch_init((int)tokens.size(), 0, 1);
-batch.n_tokens = (int)tokens.size();
-for (int i = 0; i < batch.n_tokens; ++i) {
-batch.token[i]     = tokens[i];
-batch.pos[i]       = i;
-batch.n_seq_id[i]  = 1;
-batch.seq_id[i][0] = 0;
-batch.logits[i]    = (i == batch.n_tokens - 1);
-}
-if (llama_decode(gen_ctx, batch) != 0) {
-llama_batch_free(batch);
+if (decode_prompt_chunked(gen_ctx, tokens) != 0) {
 LOGE("decode failed on prompt");
 return nullptr;
 }
@@ -437,8 +531,7 @@ llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.80f, 1));
 llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.55f));
 llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-const int max_new_tokens = 640;
-int cur_pos = batch.n_tokens;
+int cur_pos = (int)tokens.size();
 
 std::string output;
 char buf[8192];
@@ -474,10 +567,24 @@ llama_batch_free(step);
 }
 
 llama_sampler_free(sampler);
-llama_batch_free(batch);
 
 std::string clean = sanitize_generation(output);
 return env->NewStringUTF(clean.c_str());
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+        Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, jstring input) {
+return generate_impl(env, input, /*explicit_limit*/ false, kLegacyMaxNewTokens);
+}
+
+// generate() with an explicit output limit and no prompt truncation; see
+// generate_impl() for the contract.
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_com_llamatik_library_platform_LlamaBridge_generateWithLimit(
+        JNIEnv *env, jobject, jstring input, jint maxNewTokens) {
+return generate_impl(env, input, /*explicit_limit*/ true, (int) maxNewTokens);
 }
 
 extern "C"
@@ -535,8 +642,15 @@ static inline bool is_eot_piece(const char* s) {
     return std::strcmp(s, "<end_of_turn>") == 0 || std::strcmp(s, "<|eot_id|>") == 0;
 }
 
-// Streams tokens from a prepared prompt string
-static void stream_from_prompt(JNIEnv* env, const char* prompt, jobject jCallback, const StreamMethods& m) {
+// Streams tokens from a prepared prompt string.
+//
+// explicit_limit / max_new_tokens_req follow the same contract as
+// generate_impl(): false keeps the original cap and front truncation,
+// true clamps the limit to 1..n_ctx and never truncates. A prompt that does
+// not fit is reported like every other error before the first token:
+// onError("prompt_too_long: <prompt> + <max> > <n_ctx>") and no onComplete.
+static void stream_from_prompt(JNIEnv* env, const char* prompt, jobject jCallback, const StreamMethods& m,
+        bool explicit_limit, int max_new_tokens_req) {
 if (!gen_ctx || !gen_model) {
 env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("model not initialized"));
 return;
@@ -554,19 +668,18 @@ return;
 tokens.resize(n_tokens);
 
 const int n_ctx = llama_n_ctx(gen_ctx);
-if ((int)tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
+int max_new_tokens = kLegacyMaxNewTokens;
+if (explicit_limit) {
+    max_new_tokens = clamp_max_new_tokens(max_new_tokens_req, n_ctx);
+    if (n_tokens + max_new_tokens > n_ctx) {
+        const std::string msg = prompt_too_long_message(n_tokens, max_new_tokens, n_ctx);
+        LOGE("%s", msg.c_str());
+        env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF(msg.c_str()));
+        return;
+    }
+} else if ((int)tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
 
-llama_batch batch = llama_batch_init((int)tokens.size(), 0, 1);
-batch.n_tokens = (int)tokens.size();
-for (int i = 0; i < batch.n_tokens; ++i) {
-batch.token[i]     = tokens[i];
-batch.pos[i]       = i;
-batch.n_seq_id[i]  = 1;
-batch.seq_id[i][0] = 0;
-batch.logits[i]    = (i == batch.n_tokens - 1);
-}
-if (llama_decode(gen_ctx, batch) != 0) {
-llama_batch_free(batch);
+if (decode_prompt_chunked(gen_ctx, tokens) != 0) {
 env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("llama_decode failed on prompt"));
 return;
 }
@@ -578,8 +691,7 @@ llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.80f, 1));
 llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.55f));
 llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-const int max_new_tokens = 640;
-int cur_pos = batch.n_tokens;
+int cur_pos = (int)tokens.size();
 
 char piece_buf[768];
 char spec_buf[64];
@@ -632,7 +744,6 @@ llama_batch_free(step);
 }
 
 llama_sampler_free(sampler);
-llama_batch_free(batch);
 
 env->CallVoidMethod(jCallback, m.onComplete);
 }
@@ -655,7 +766,31 @@ if (!prompt) {
 env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("prompt decode failed"));
 return;
 }
-stream_from_prompt(env, prompt, jCallback, m);
+stream_from_prompt(env, prompt, jCallback, m, /*explicit_limit*/ false, kLegacyMaxNewTokens);
+env->ReleaseStringUTFChars(jPrompt, prompt);
+}
+
+// JNI: streamWithLimit(prompt, maxNewTokens, callback) — nativeGenerateStream()
+// with an explicit output limit and no prompt truncation; see
+// stream_from_prompt() for how a prompt that does not fit is reported.
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_llamatik_library_platform_LlamaBridge_nativeGenerateStreamWithLimit(
+        JNIEnv* env, jobject /*thiz*/, jstring jPrompt, jint maxNewTokens, jobject jCallback) {
+if (!jPrompt || !jCallback) return;
+
+StreamMethods m{};
+if (!resolve_stream_methods(env, jCallback, m)) {
+LOGE("nativeGenerateStreamWithLimit: failed to resolve callback methods");
+return;
+}
+
+const char* prompt = env->GetStringUTFChars(jPrompt, nullptr);
+if (!prompt) {
+env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("prompt decode failed"));
+return;
+}
+stream_from_prompt(env, prompt, jCallback, m, /*explicit_limit*/ true, (int) maxNewTokens);
 env->ReleaseStringUTFChars(jPrompt, prompt);
 }
 
@@ -693,5 +828,5 @@ system = "You are a careful assistant. Answer ONLY from the provided context. "
 std::string user_turn = build_user_with_context(ctx, user);
 std::string prompt    = build_chat_prompt_gemma(system, user_turn);
 
-stream_from_prompt(env, prompt.c_str(), jCallback, m);
+stream_from_prompt(env, prompt.c_str(), jCallback, m, /*explicit_limit*/ false, kLegacyMaxNewTokens);
 }

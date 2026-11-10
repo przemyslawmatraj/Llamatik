@@ -39,6 +39,35 @@ actual object LlamaBridge {
         nativeGenerateStream(prompt, callback)
     }
 
+    // ---- Explicit context window and output limit (Android only, not in expect) ----
+
+    /**
+     * Same as [initGenerateModel], but with the context window chosen by the caller:
+     * n_ctx = [nCtx] clamped to 512..32768, n_batch = min(2048, n_ctx); everything else
+     * (n_ubatch, KV cache types, threads) stays at the llama.cpp defaults.
+     */
+    external fun initGenerateModelWithContext(modelPath: String, nCtx: Int): Boolean
+
+    /**
+     * Like [generate], but with an explicit output limit ([maxNewTokens], clamped to
+     * 1..n_ctx) and without prompt truncation. Returns null when prompt tokens +
+     * maxNewTokens > n_ctx (logcat: "prompt_too_long: <prompt> + <max> > <n_ctx>"),
+     * and on the same failures where [generate] gets null from native code.
+     */
+    external fun generateWithLimit(prompt: String, maxNewTokens: Int): String?
+
+    private external fun nativeGenerateStreamWithLimit(prompt: String, maxNewTokens: Int, callback: GenStream)
+
+    /**
+     * Like [generateStream], but with an explicit output limit ([maxNewTokens], clamped
+     * to 1..n_ctx) and without prompt truncation. When prompt tokens + maxNewTokens >
+     * n_ctx, only `callback.onError("prompt_too_long: <prompt> + <max> > <n_ctx>")` is
+     * called (no onComplete), as for the other errors before the first token.
+     */
+    fun generateStreamWithLimit(prompt: String, maxNewTokens: Int, callback: GenStream) {
+        nativeGenerateStreamWithLimit(prompt, maxNewTokens, callback)
+    }
+
     // Compose the same chat prompt you use on native. This mirrors your Gemma-style tags
     // and matches the EOT checks we added in C++ (<start_of_turn>, <end_of_turn>, <|eot_id|>).
     private fun buildChatPrompt(systemPrompt: String, contextBlock: String, userPrompt: String): String {
